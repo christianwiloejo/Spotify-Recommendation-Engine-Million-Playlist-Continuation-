@@ -6,7 +6,7 @@
 # COMMAND ----------
 
 # MAGIC %md 
-# MAGIC ## Import Packages
+# MAGIC # Import Packages
 
 # COMMAND ----------
 
@@ -21,7 +21,7 @@ import pandas as pd
 # COMMAND ----------
 
 # MAGIC %md 
-# MAGIC ## File Complete Checker (One Time Process)
+# MAGIC # File Complete Checker (One Time Process)
 
 # COMMAND ----------
 
@@ -43,7 +43,7 @@ import pandas as pd
 # COMMAND ----------
 
 # MAGIC %md 
-# MAGIC ## Reading, Transforming and Writing JSON Raw Data to Parquet (One Time Process)
+# MAGIC # Reading, Transforming and Writing JSON Raw Data to Parquet (One Time Process)
 
 # COMMAND ----------
 
@@ -81,7 +81,7 @@ import pandas as pd
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1. Read Parquet File
+# MAGIC # 1. Read Parquet File
 
 # COMMAND ----------
 
@@ -96,7 +96,7 @@ raw_df.select('pid').distinct().count()
 # COMMAND ----------
 
 # MAGIC %md 
-# MAGIC ## 2. Prepare Data for PySpark ALS Model 
+# MAGIC # 2. Prepare Data for PySpark ALS Model 
 # MAGIC The goal: we need to end up with a dataframe that lists all playlists, tracks, and a column to indicate whether a track is in the playlist or not.  
 # MAGIC The way: we need to cross join the distinct playlist series to the distinct tracks series.
 
@@ -132,7 +132,7 @@ raw_df.show()
 # COMMAND ----------
 
 # MAGIC %md 
-# MAGIC ## 3. Subset of the Data
+# MAGIC # 3. Subset of the Data
 
 # COMMAND ----------
 
@@ -172,7 +172,7 @@ display(cross_join.where("song_exist_in_playlist<>0").groupBy('track_uri_int').c
 # COMMAND ----------
 
 # MAGIC %md 
-# MAGIC ### 3.1 ROEM Function for Evaluating Our Recommender System
+# MAGIC ## 3.1 ROEM Function for Evaluating Our Recommender System
 
 # COMMAND ----------
 
@@ -224,15 +224,17 @@ print(ROEM(prediction))
 
 # COMMAND ----------
 
-prediction.count()
+five_playlist_prediction = prediction.filter(prediction.pid < 5)
+five_playlist_prediction.show()
 
 # COMMAND ----------
 
-display(prediction.filter(prediction.pid < 5).join(subset_1000, "track_uri_int", "left").join(raw_df.select('track_uri', 'track_name'), 'track_uri', "left"))
+display(prediction.filter().distinct().join(subset_1000, "track_uri_int", "left").join(raw_df.select('track_uri', 'track_name'), 'track_uri', "left"))
 
 # COMMAND ----------
 
-
+# MAGIC %md
+# MAGIC # 4. All Data
 
 # COMMAND ----------
 
@@ -266,6 +268,10 @@ sqlContext.getConf("spark.driver.maxResultSize")
 # COMMAND ----------
 
 cross_join_df.write.parquet("/dbfs/FileStore/spotify_million_playlist_raw_data/02 cross_joined_all_songs_all_playlists_joined_original_df.parquet")
+
+# COMMAND ----------
+
+
 
 # COMMAND ----------
 
