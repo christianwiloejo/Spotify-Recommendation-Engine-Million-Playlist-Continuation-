@@ -1,1 +1,2 @@
-# spotify-million-playlist-continuation
+# Spotify Million Playlist Continuation
+## by Christian Wiloejo
