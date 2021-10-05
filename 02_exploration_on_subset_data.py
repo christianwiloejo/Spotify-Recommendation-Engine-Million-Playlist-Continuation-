@@ -17,6 +17,7 @@ from functools import reduce
 from pyspark.sql import DataFrame
 from pprint import pprint
 import pandas as pd
+from pyspark.ml.recommendation import ALS
 
 # COMMAND ----------
 
@@ -80,28 +81,30 @@ subset_1000 = raw_df.filter(raw_df['pid'] < 1000).select('pid', 'track_uri', 'so
 
 
 # Replace the track_uri with integer for ALS model
-tracks_distinct = raw_df.select('track_uri').distinct()
+tracks_distinct = subset_1000.select('track_uri').distinct()
 tracks_distinct = tracks_distinct.coalesce(1)
 tracks_distinct = tracks_distinct.rdd.zipWithIndex().toDF()
 tracks_distinct = tracks_distinct.withColumnRenamed('_1', 'track_uri')\
                     .withColumnRenamed('_2', 'track_uri_int')
 tracks_distinct = tracks_distinct.select('track_uri.*', 'track_uri_int')
-subset_1000 = subset_1000.join(tracks_distinct, "track_uri", "left")
+
+# Join the tracks_distinct with unique id per track to the main dataframe
+subset_1000 = subset_1000.join(tracks_distinct, ['track_uri'], "left")
 subset_1000.orderBy(['pid', 'track_uri_int'], ascending = True).show()
 
 # COMMAND ----------
 
+# Select the relevant columns
 subset_1000_clean = subset_1000.select('pid', 'track_uri_int', 'song_exist_in_playlist')
+
 # Extract distinct playlists 
 playlists_subset_1000 = subset_1000_clean.select('pid').distinct()
-# playlists = playlists.coalesce(32)
 
 # Extract distinct tracks
 songs_subset_1000 = subset_1000_clean.select('track_uri_int').distinct()
-# songs = songs.coalesce(32)
 
 cross_join = playlists_subset_1000.crossJoin(songs_subset_1000).join(subset_1000_clean, ['pid', 'track_uri_int'], 'left').fillna(0)
-cross_join.show()
+cross_join.orderBy('pid').show()
 
 
 # COMMAND ----------
@@ -132,10 +135,10 @@ def ROEM(predictions):
 
 # COMMAND ----------
 
-(train, test) = cross_join.randomSplit([0.8, 0.2])
+# Train, Test Split
+(train, test) = cross_join.randomSplit([0.8, 0.2], seed = 123)
 
 # Build ALS Model
-from pyspark.ml.recommendation import ALS
 als = ALS(
   userCol = "pid",
   itemCol = "track_uri_int",
@@ -159,60 +162,21 @@ print(ROEM(prediction))
 
 # COMMAND ----------
 
-recommend_10 = model.recommendForAllUsers(10)\
+recommend_10 = model.recommendForAllUsers(5)\
   .selectExpr("pid", "explode(recommendations) as recommendation_val_score")\
   .select("pid", 'recommendation_val_score.*')\
-
+  .withColumnRenamed("pid", "recommend_pid")
 recommend_10.show()
 
 # COMMAND ----------
 
-recommend_10_w_track_uri = recommend_10.join(subset_1000, on = 'track_uri_int', how = 'left')
+recommend_10_w_track_uri = recommend_10\
+                              .join(tracks_distinct, on = 'track_uri_int', how = 'left')\
+                              .join(cross_join, (recommend_10.recommend_pid == cross_join.pid) & (recommend_10.track_uri_int == cross_join.track_uri_int), how = 'left')
 
-display(recommend_10_w_track_uri.orderBy('pid', ascending=True))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # 4. All Data
+display(recommend_10_w_track_uri.orderBy('recommend_pid', ascending=True))
 
 # COMMAND ----------
 
 
-
-# COMMAND ----------
-
-# Extract distinct playlists 
-playlists = raw_df.select('pid').distinct()
-playlists = playlists.coalesce(32)
-# print(playlists.count())
-# print(playlists.rdd.getNumPartitions())
-
-# Extract distinct tracks
-songs = raw_df.select('track_uri').distinct()
-songs = songs.coalesce(32)
-
-# print(songs.count())
-# print(raw_df.count())
-print(songs.rdd.getNumPartitions())
-
-# COMMAND ----------
-
-# Joins playlists and tracks, fills blanks with 0
-cross_join_df = playlists.crossJoin(broadcast(songs)).join(broadcast(raw_df), ['pid', 'track_uri'], 'left').fillna(0)
-
-# COMMAND ----------
-
-sqlContext.getConf("spark.driver.maxResultSize")
-
-# COMMAND ----------
-
-cross_join_df.write.parquet("/dbfs/FileStore/spotify_million_playlist_raw_data/02 cross_joined_all_songs_all_playlists_joined_original_df.parquet")
-
-# COMMAND ----------
-
-
-
-# COMMAND ----------
-
-
+display(subset_1000.filter(subset_1000.pid == 5))
