@@ -20,66 +20,6 @@ import pandas as pd
 
 # COMMAND ----------
 
-# MAGIC %md 
-# MAGIC # File Complete Checker (One Time Process)
-
-# COMMAND ----------
-
-# def completeUpload(file_path = '/dbfs/FileStore/spotify_million_playlist_raw_data/', count = 1000, checklist = pd.DataFrame({'file_range':np.arange(0,1000000,1000)})):
-#   directory_files_df = pd.DataFrame({'files_in_dir': os.listdir(file_path)})
-#   if directory_files_df.shape[0] == count: 
-#     print('Complete JSON files uploaded to DBFS...')
-#   else: 
-#     print('The following files are missing')
-#     directory_files_df['left_num'] = directory_files_df['files_in_dir'].str.split('mpd_slice_').str[1].str.split('_').str[0].astype('int')
-#     checklist = pd.DataFrame({'file_range':np.arange(0,1000000,1000).tolist()})
-#     print(checklist.loc[~checklist['file_range'].isin(directory_files_df['left_num'])])
-# completeUpload()
-
-# COMMAND ----------
-
-# %fs rm -r 'dbfs:/FileStore/spotify_million_playlist_raw_data/'
-
-# COMMAND ----------
-
-# MAGIC %md 
-# MAGIC # Reading, Transforming and Writing JSON Raw Data to Parquet (One Time Process)
-
-# COMMAND ----------
-
-# DfAppend = []
-
-# path = '/dbfs/FileStore/spotify_million_playlist_raw_data/'
-# count = 0 
-# for json_file in os.listdir(path):
-  
-#   json_file_path = 'dbfs:/FileStore/spotify_million_playlist_raw_data/' + json_file
-#   master_df = (spark.read
-#       .option("inferSchema", True)
-#       .option("multiline", True)
-#       .json(json_file_path))
-#   print(json_file_path)
-#   playlists_df = master_df.select(explode("playlists").alias('playlists'))
-  
-#   playlists_tracks_df = playlists_df.select("playlists.pid", "playlists.name", explode("playlists.tracks").alias("tracks"))
-#   playlists_tracks_df = playlists_tracks_df.withColumnRenamed("playlists.pid", "pid").withColumnRenamed("playlists.name", "playlist_name")
-  
-#   final_df = playlists_tracks_df.select("pid","playlist_name", "tracks.*")
-  
-  
-#   DfAppend.append(final_df)
-#   count += 1
-  
-#   print(f"Completed {count}/{len(os.listdir(path))}")
-
-# #Concatenate all dataframes
-# df = reduce(DataFrame.unionAll, DfAppend)
-
-# #Write to parquet
-# df.write.parquet("/dbfs/FileStore/spotify_million_playlist_raw_data/all_playlists_tracks_parsed.parquet")
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC # 1. Read Parquet File
 
@@ -102,15 +42,15 @@ raw_df.select('pid').distinct().count()
 
 # COMMAND ----------
 
-# Check out sparsity value
-playlists = raw_df.select('pid').distinct().count()
-songs = raw_df.select('track_uri').distinct().count()
+# # Check out sparsity value
+# playlists = raw_df.select('pid').distinct().count()
+# songs = raw_df.select('track_uri').distinct().count()
 
-denom = playlists*songs
-numera = raw_df.select('track_uri').count()
+# denom = playlists*songs
+# numera = raw_df.select('track_uri').count()
 
-sparsity = 1-((numera*1.0)/denom)
-print(f"Sparsity: {sparsity}")
+# sparsity = 1-((numera*1.0)/denom)
+# print(f"Sparsity: {sparsity}")
 
 # COMMAND ----------
 
@@ -142,9 +82,12 @@ subset_1000 = raw_df.filter(raw_df['pid'] < 1000).select('pid', 'track_uri', 'so
 # Replace the track_uri with integer for ALS model
 tracks_distinct = raw_df.select('track_uri').distinct()
 tracks_distinct = tracks_distinct.coalesce(1)
-tracks_distinct = tracks_distinct.withColumn("track_uri_int", monotonically_increasing_id()).persist()
+tracks_distinct = tracks_distinct.rdd.zipWithIndex().toDF()
+tracks_distinct = tracks_distinct.withColumnRenamed('_1', 'track_uri')\
+                    .withColumnRenamed('_2', 'track_uri_int')
+tracks_distinct = tracks_distinct.select('track_uri.*', 'track_uri_int')
 subset_1000 = subset_1000.join(tracks_distinct, "track_uri", "left")
-subset_1000.orderBy('track_uri_int', ascending = True).show()
+subset_1000.orderBy(['pid', 'track_uri_int'], ascending = True).show()
 
 # COMMAND ----------
 
@@ -160,14 +103,6 @@ songs_subset_1000 = subset_1000_clean.select('track_uri_int').distinct()
 cross_join = playlists_subset_1000.crossJoin(songs_subset_1000).join(subset_1000_clean, ['pid', 'track_uri_int'], 'left').fillna(0)
 cross_join.show()
 
-
-# COMMAND ----------
-
-cross_join.filter(cross_join['song_exist_in_playlist'] != 0).show()
-
-# COMMAND ----------
-
-display(cross_join.where("song_exist_in_playlist<>0").groupBy('track_uri_int').count())
 
 # COMMAND ----------
 
@@ -224,12 +159,17 @@ print(ROEM(prediction))
 
 # COMMAND ----------
 
-five_playlist_prediction = prediction.filter(prediction.pid < 5)
-five_playlist_prediction.show()
+recommend_10 = model.recommendForAllUsers(10)\
+  .selectExpr("pid", "explode(recommendations) as recommendation_val_score")\
+  .select("pid", 'recommendation_val_score.*')\
+
+recommend_10.show()
 
 # COMMAND ----------
 
-display(prediction.filter().distinct().join(subset_1000, "track_uri_int", "left").join(raw_df.select('track_uri', 'track_name'), 'track_uri', "left"))
+recommend_10_w_track_uri = recommend_10.join(subset_1000, on = 'track_uri_int', how = 'left')
+
+display(recommend_10_w_track_uri.orderBy('pid', ascending=True))
 
 # COMMAND ----------
 
