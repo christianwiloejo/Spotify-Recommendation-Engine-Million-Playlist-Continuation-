@@ -18,6 +18,7 @@ from pyspark.sql import DataFrame
 from pprint import pprint
 import pandas as pd
 from pyspark.ml.recommendation import ALS
+from pyspark.sql.types import IntegerType
 
 # COMMAND ----------
 
@@ -111,7 +112,7 @@ raw_df.show()
 
 # COMMAND ----------
 
-subset_1000 = raw_df.filter(raw_df['pid'] < 1000).select('pid', 'track_uri', 'song_exist_in_playlist')
+# raw_df = raw_df.filter(raw_df['pid'] < 1000).select('pid', 'track_uri', 'song_exist_in_playlist')
 
 # COMMAND ----------
 
@@ -120,9 +121,8 @@ subset_1000 = raw_df.filter(raw_df['pid'] < 1000).select('pid', 'track_uri', 'so
 
 # COMMAND ----------
 
-
 # Replace the track_uri with integer for ALS model
-tracks_distinct = subset_1000.select('track_uri').distinct()
+tracks_distinct = raw_df.select('track_uri').distinct()
 tracks_distinct = tracks_distinct.coalesce(1)
 tracks_distinct = tracks_distinct.rdd.zipWithIndex().toDF()
 tracks_distinct = tracks_distinct.withColumnRenamed('_1', 'track_uri')\
@@ -130,23 +130,62 @@ tracks_distinct = tracks_distinct.withColumnRenamed('_1', 'track_uri')\
 tracks_distinct = tracks_distinct.select('track_uri.*', 'track_uri_int')
 
 # Join the tracks_distinct with unique id per track to the main dataframe
-subset_1000 = subset_1000.join(tracks_distinct, ['track_uri'], "left")
-subset_1000.orderBy(['pid', 'track_uri_int'], ascending = True).show()
+df = raw_df.join(tracks_distinct, ['track_uri'], "left")
+df.orderBy(['pid', 'track_uri_int'], ascending = True).show()
 
 # COMMAND ----------
 
 # Select the relevant columns
-subset_1000_clean = subset_1000.select('pid', 'track_uri_int', 'song_exist_in_playlist')
+df_clean = df.select('pid', 'track_uri_int', 'song_exist_in_playlist')
+df_clean = df_clean.selectExpr("cast(pid as int) pid", "cast(track_uri_int as int) track_uri_int", "cast(song_exist_in_playlist as int) song_exist_in_playlist")
 
 # Extract distinct playlists 
-playlists_subset_1000 = subset_1000_clean.select('pid').distinct()
+playlists_distinct = df_clean.select('pid').distinct()
+playlists_distinct = playlists_distinct.selectExpr('cast(pid as int) pid')
+# playlists_distinct = playlists_distinct.withColumnRenamed("pid", "repartition_id")
+playlists_distinct = playlists_distinct.repartition(400, playlists_distinct["pid"])
 
 # Extract distinct tracks
-songs_subset_1000 = subset_1000_clean.select('track_uri_int').distinct()
+tracks_distinct = df_clean.select('track_uri_int').distinct()
+tracks_distinct = tracks_distinct.selectExpr('cast(track_uri_int as int) track_uri_int')
+# tracks_distinct = tracks_distinct.withColumnRenamed("track_uri_int", "repartition_id")
 
-cross_join = playlists_subset_1000.crossJoin(songs_subset_1000).join(subset_1000_clean, ['pid', 'track_uri_int'], 'left').fillna(0)
-cross_join.orderBy('pid').show()
 
+
+
+
+# COMMAND ----------
+
+spark.conf.set("spark.databricks.queryWatchdog.enabled", False)
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+# spark.conf.set("spark.databricks.queryWatchdog.outputRatioThreshold", '50000')
+
+# COMMAND ----------
+
+playlists_distinct.cache()
+playlists_distinct.count()
+
+cross_joined = broadcast(playlists_distinct).crossJoin(tracks_distinct.repartition(400, tracks_distinct["track_uri_int"]))#.join(df_clean, ['pid', 'track_uri_int'], 'left').fillna(0)
+cross_joined.explain()
+# cross_joined.orderBy('pid').show()
+
+# COMMAND ----------
+
+cross_joined.show()
+
+# COMMAND ----------
+
+# cross_joined.rdd.getNumPartitions()
+# cross_joined = cross_joined.repartition(200)
+cross_joined.write.parquet("/dbfs/FileStore/spotify_million_playlist_raw_data/01_playlist_tracks_cross_joined_step1of2.parquet")
+
+# COMMAND ----------
+
+cross_joined_w_exist = cross_joined.join(df_clean, ['pid', 'track_uri_int'], 'left').fillna(0)
+
+# COMMAND ----------
+
+# cross_joined_w_exist.show()
 
 # COMMAND ----------
 
@@ -156,7 +195,7 @@ cross_join.orderBy('pid').show()
 # COMMAND ----------
 
 # Train, Test Split
-(train, test) = cross_join.randomSplit([0.8, 0.2], seed = 123)
+(train, test) = cross_joined_w_exist.randomSplit([0.8, 0.2], seed = 123)
 
 # Build ALS Model
 als = ALS(
@@ -192,11 +231,11 @@ recommend_10.show()
 
 recommend_10_w_track_uri = recommend_10\
                               .join(tracks_distinct, on = 'track_uri_int', how = 'left')\
-                              .join(cross_join, (recommend_10.recommend_pid == cross_join.pid) & (recommend_10.track_uri_int == cross_join.track_uri_int), how = 'left')
+                              .join(cross_joined, (recommend_10.recommend_pid == cross_joined.pid) & (recommend_10.track_uri_int == cross_joined.track_uri_int), how = 'left')
 
 display(recommend_10_w_track_uri.orderBy('recommend_pid', ascending=True))
 
 # COMMAND ----------
 
 
-display(subset_1000.filter(subset_1000.pid == 5))
+display(df.filter(df.pid == 5))
