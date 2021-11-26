@@ -12,15 +12,13 @@
 
 import os
 import numpy as np
-from numpy import *
 from pyspark.sql.functions import *
 from functools import reduce
 from pyspark.sql import DataFrame
 from pprint import pprint
 import pandas as pd
-from pyspark.ml.recommendation import ALS, ALSModel
+from pyspark.ml.recommendation import ALS
 from pyspark.sql.types import IntegerType
-from pyspark.mllib.linalg import SparseVector, SparseMatrix
 
 # COMMAND ----------
 
@@ -60,8 +58,8 @@ def ROEM(predictions):
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # 1. Read Parquet File and Reduce Tracks
-# MAGIC As we can see, there are 1 million playlists, which contains 2,262,292 distinct tracks. When performing cartesian join for our ALS model, this will produce around 2 trillion rows. To save time and resources, we need to cut the tracks data down. 
+# MAGIC # 1. Read Parquet File
+# MAGIC As we can see, there are 1 million playlists, which contains 2,262,292 distinct tracks.
 
 # COMMAND ----------
 
@@ -70,24 +68,11 @@ raw_df.show(5)
 
 # COMMAND ----------
 
-print(f"There is {raw_df.select('pid').distinct().count()} distinct playlists, and {raw_df.select('track_uri').distinct().count()} distinct tracks.")
+raw_df.select('pid').distinct().count()
 
 # COMMAND ----------
 
-# MAGIC %md 
-# MAGIC ## 1.1 Limiting number of distinct songs for faster processing
-
-# COMMAND ----------
-
-count_pid_by_song = raw_df.groupBy('track_uri').count()
-count_pid_by_song.orderBy("count", ascending=False)
-track_uri_more_100_pids = count_pid_by_song.where("count > 5000").select('track_uri')
-print(f"Now, there are {track_uri_more_100_pids.count()} distinct tracks. This is easier to process.")
-
-# COMMAND ----------
-
-raw_df = raw_df.join(track_uri_more_100_pids, on = 'track_uri')
-raw_df.count()
+raw_df.select('track_uri').distinct().count()
 
 # COMMAND ----------
 
@@ -153,16 +138,48 @@ tracks_distinct = tracks_distinct.selectExpr('cast(track_uri_int as int) track_u
 
 # COMMAND ----------
 
-cross_joined = playlists_distinct.crossJoin(broadcast(tracks_distinct.repartition(400, tracks_distinct["track_uri_int"])))
-
-df_clean = df_clean.repartition(400)
-cross_joined_w_exist = cross_joined.join(broadcast(df_clean.repartition(400)), ['pid', 'track_uri_int'], 'left').fillna(0)
+spark.conf.set("spark.databricks.queryWatchdog.enabled", False)
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+# spark.conf.set("spark.databricks.queryWatchdog.outputRatioThreshold", '50000')
 
 # COMMAND ----------
 
-# (cross_joined_w_exist.write.format("parquet")
-#       .mode("overwrite")
-#       .save("/dbfs/FileStore/spotify_million_playlist_raw_data/playlist_tracks_cross_joined.parquet"))
+playlists_distinct.cache()
+playlists_distinct.count()
+
+cross_joined = broadcast(playlists_distinct).crossJoin(tracks_distinct.repartition(400, tracks_distinct["track_uri_int"]))#.join(df_clean, ['pid', 'track_uri_int'], 'left').fillna(0)
+cross_joined.explain()
+# cross_joined.orderBy('pid').show()
+
+# COMMAND ----------
+
+cross_joined.count()
+
+# COMMAND ----------
+
+cross_joined.rdd.getNumPartitions()
+
+# COMMAND ----------
+
+df_clean.rdd.getNumPartitions()
+
+# COMMAND ----------
+
+df_clean = df_clean.repartition(400)
+cross_joined_w_exist = cross_joined.join(df_clean.repartition(400), ['pid', 'track_uri_int'], 'left')#.fillna(0)
+
+# COMMAND ----------
+
+cross_joined_w_exist.write.format("delta").mode("overwrite").partitionBy("pid").save("/delta/spotify_playlist_track/")
+
+# COMMAND ----------
+
+# cross_joined.rdd.getNumPartitions()
+# cross_joined = cross_joined.repartition(200)
+(cross_joined.write.format("parquet")
+      .mode("overwrite")
+      .option("compression", "snappy")
+      .save("/dbfs/FileStore/spotify_million_playlist_raw_data/01_playlist_tracks_cross_joined_step1of2"))
 
 # COMMAND ----------
 
@@ -171,34 +188,16 @@ cross_joined_w_exist = cross_joined.join(broadcast(df_clean.repartition(400)), [
 
 # COMMAND ----------
 
-cross_joined_w_exist = spark.read.parquet("/dbfs/FileStore/spotify_million_playlist_raw_data/playlist_tracks_cross_joined.parquet")
-cross_joined_w_exist = cross_joined_w_exist.repartition(100)
-cross_joined_w_exist.rdd.getNumPartitions()
-
-
-# COMMAND ----------
-
 # Train, Test Split
 (train, test) = cross_joined_w_exist.randomSplit([0.8, 0.2], seed = 123)
 
-# COMMAND ----------
-
-// %scala
-// spark.conf.set("spark.sql.shuffle.partitions",100)
-// spark.conf.set("spark.default.parallelism",100)
-// spark.conf.set("spark.sql.autoBroadcastJoinThreshold",-1)
-
-# COMMAND ----------
-
-# Set checkpoint
-# sc.setCheckpointDir('/checkpoint/')
 # Build ALS Model
 als = ALS(
   userCol = "pid",
   itemCol = "track_uri_int",
   ratingCol = "song_exist_in_playlist", 
   rank = 25, 
-  maxIter = 10, 
+  maxIter = 100, 
   regParam=.05, 
   alpha = 20,
   nonnegative=True, 
@@ -216,42 +215,47 @@ print(ROEM(prediction))
 
 # COMMAND ----------
 
-model.write().overwrite().save('/model/spotify_03_main_analysis_model')
+# Train, Test Split
+(train, test) = cross_joined_w_exist.randomSplit([0.8, 0.2], seed = 123)
+
+# Build ALS Model
+als = ALS(
+  userCol = "pid",
+  itemCol = "track_uri_int",
+  ratingCol = "song_exist_in_playlist", 
+  rank = 25, 
+  maxIter = 100, 
+  regParam=.05, 
+  alpha = 20,
+  nonnegative=True, 
+  coldStartStrategy="drop", 
+  implicitPrefs=True)
+
+# Fit model to train data
+model = als.fit(train)
+
+#Generate predictions on test data
+prediction = model.transform(test)
+
+#Tell Spark how to evaluate predictions
+print(ROEM(prediction))
 
 # COMMAND ----------
 
-model = ALSModel.load('/model/spotify_03_main_analysis_model')
-
-# COMMAND ----------
-
-recommend_5 = model.recommendForAllUsers(5)\
+recommend_10 = model.recommendForAllUsers(5)\
   .selectExpr("pid", "explode(recommendations) as recommendation_val_score")\
   .select("pid", 'recommendation_val_score.*')\
   .withColumnRenamed("pid", "recommend_pid")
-recommend_5.show(15)
+recommend_10.show()
 
 # COMMAND ----------
 
-df = df.withColumn('track_uri_int', df["track_uri_int"].cast("int"))
-df = df.repartition("track_uri_int")#.cache()
-# df.count()
-recommend_5 = recommend_5.repartition("track_uri_int")
+recommend_10_w_track_uri = recommend_10\
+                              .join(tracks_distinct, on = 'track_uri_int', how = 'left')\
+                              .join(cross_joined, (recommend_10.recommend_pid == cross_joined.pid) & (recommend_10.track_uri_int == cross_joined.track_uri_int), how = 'left')
+
+display(recommend_10_w_track_uri.orderBy('recommend_pid', ascending=True))
 
 # COMMAND ----------
 
-track_info = df.select('track_uri', 'track_uri_int', 'track_name', 'artist_name', 'album_name').distinct()
-
-recommend_5_w_track_uri = (recommend_5
-                              .join(track_info, on = 'track_uri_int', how = 'left')).cache()
-
-# COMMAND ----------
-
-recommend_5_w_track_uri.orderBy('recommend_pid').show(1000, truncate = False)
-
-# COMMAND ----------
-
-display(df.filter(df.pid == 209))
-
-# COMMAND ----------
-
-
+display(df.filter(df.pid == 5))
